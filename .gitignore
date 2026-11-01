@@ -1,0 +1,4 @@
+/artifact-store
+/bin/
+*.test
+*.out
