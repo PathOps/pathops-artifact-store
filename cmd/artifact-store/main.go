@@ -1,15 +1,16 @@
-// Command artifact-store runs the PathOps Artifact Store: a Cell-internal
-// HTTPS service that stores immutable, opaque artifact bundles behind the
+// Command artifact-store runs the PathOps Artifact Store: a Cell tool, served
+// over HTTPS, that stores immutable, opaque artifact bundles behind the
 // ArtifactStore abstraction (internal/store), with the filesystem backend
-// (internal/store/fsstore) on the Cell's persistent volume. Workloads
-// authenticate with Kubernetes ServiceAccount tokens (TokenReview) and act
-// within attempt-scoped capabilities (internal/capability). The configuration
-// comes from the environment (internal/config).
+// (internal/store/fsstore) on the Cell's persistent volume. Workloads present
+// Application-scoped tokens Dex issues (internal/workload); people sign in
+// with the Cell's Dex (internal/human). The configuration comes from the
+// environment (internal/config).
 package main
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"log/slog"
@@ -18,14 +19,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
-	"github.com/PathOps/pathops-artifact-store/internal/auth"
-	"github.com/PathOps/pathops-artifact-store/internal/capability"
 	"github.com/PathOps/pathops-artifact-store/internal/config"
+	"github.com/PathOps/pathops-artifact-store/internal/human"
 	"github.com/PathOps/pathops-artifact-store/internal/server"
 	"github.com/PathOps/pathops-artifact-store/internal/store/fsstore"
+	"github.com/PathOps/pathops-artifact-store/internal/workload"
 )
 
 func main() {
@@ -49,15 +51,33 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer st.Close()
-	key, err := capability.LoadOrCreateKey(filepath.Join(cfg.DataDir, "capability.key"))
+	pub, err := workload.LoadPublicKey(cfg.TokenPublicKeyFile)
 	if err != nil {
 		return err
 	}
-	signer, err := capability.NewSigner(key)
+	secret, err := os.ReadFile(cfg.OIDCSecretFile)
 	if err != nil {
 		return err
 	}
-	tr, err := auth.InCluster(cfg.Audience)
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	if cfg.OIDCCAFile != "" {
+		ca, err := os.ReadFile(cfg.OIDCCAFile)
+		if err != nil {
+			return err
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(ca) {
+			return errors.New("PATHOPS_ARTIFACT_STORE_OIDC_CA_FILE holds no certificate")
+		}
+		tr.TLSClientConfig.RootCAs = roots
+	}
+	people, err := human.New(human.Config{Issuer: cfg.OIDCIssuer, ClientID: cfg.OIDCClientID,
+		ClientSecret: strings.TrimSpace(string(secret)), PublicURL: cfg.PublicURL,
+		HTTP: &http.Client{Timeout: cfg.OIDCHTTPSTimeout, Transport: tr}})
 	if err != nil {
 		return err
 	}
@@ -65,17 +85,17 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	admins := map[string]bool{}
-	for _, a := range cfg.Admins {
-		admins[a] = true
-	}
-	handler := &server.Server{Name: cfg.StoreName, Store: st, Auth: tr, Signer: signer, Admins: admins,
-		MaxObjectBytes: cfg.MaxObjectBytes, MaxTTL: cfg.MaxTTL, RequestTimeout: cfg.RequestTimeout, Log: log}
+	handler := &server.Server{Name: cfg.StoreName, Store: st,
+		Workload: &workload.Verifier{Issuer: cfg.TokenIssuer, Audience: cfg.TokenAudience, KeyID: cfg.TokenKeyID, Key: pub, Now: time.Now},
+		Human:    people, Admins: cfg.AdminEmails,
+		MaxObjectBytes: cfg.MaxObjectBytes, RequestTimeout: cfg.RequestTimeout, Log: log}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	log.Info("configuration", "name", cfg.StoreName, "dataDir", cfg.DataDir, "audience", cfg.Audience, "admins", cfg.Admins,
-		"maxObjectBytes", cfg.MaxObjectBytes, "maxCapabilityTtl", cfg.MaxTTL.String(), "requestTimeout", cfg.RequestTimeout.String())
+	log.Info("configuration", "name", cfg.StoreName, "dataDir", cfg.DataDir, "publicUrl", cfg.PublicURL,
+		"tokenIssuer", cfg.TokenIssuer, "tokenAudience", cfg.TokenAudience, "tokenKeyId", cfg.TokenKeyID,
+		"oidcIssuer", cfg.OIDCIssuer, "oidcClientId", cfg.OIDCClientID, "admins", cfg.AdminEmails,
+		"maxObjectBytes", cfg.MaxObjectBytes, "requestTimeout", cfg.RequestTimeout.String())
 	ln, err := net.Listen("tcp", cfg.ListenAddress)
 	if err != nil {
 		return err

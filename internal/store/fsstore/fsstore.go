@@ -101,7 +101,7 @@ func (s *Store) Put(ctx context.Context, req store.PutRequest, content io.Reader
 		return store.Info{}, false, store.ErrDigestMismatch
 	}
 	info := store.Info{Key: req.Key, Size: n, SHA256: sum, MediaType: req.MediaType, Metadata: req.Metadata,
-		CreatedAt: s.now().UTC().Truncate(time.Millisecond), CreatedBy: req.CreatedBy}
+		CreatedAt: s.now().UTC().Truncate(time.Millisecond), CreatedBy: req.CreatedBy, Application: req.Application, Owner: req.Owner}
 	meta, err := json.Marshal(info)
 	if err != nil {
 		return store.Info{}, false, err
@@ -110,7 +110,7 @@ func (s *Store) Put(ctx context.Context, req store.PutRequest, content io.Reader
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if old, err := s.stat(req.Key); err == nil {
-		if old.SHA256 == sum && old.Size == n {
+		if old.SHA256 == sum && old.Size == n && old.Application == req.Application {
 			return old, false, nil
 		}
 		return store.Info{}, false, store.ErrExists

@@ -1,0 +1,89 @@
+name: release
+
+# A tag vX.Y.Z publishes ghcr.io/pathops/pathops-artifact-store:vX.Y.Z,
+# consumed by digest (the workflow summary shows it).
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/pathops/pathops-artifact-store
+
+jobs:
+  # The only job that can write packages. The image is built once, here.
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go vet ./... && go test -race ./...
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ci/images/artifact-store/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            REVISION=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+          tags: ${{ env.IMAGE }}:${{ github.ref_name }}
+          push: true
+          provenance: mode=max
+          sbom: true
+
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          echo "Published ${IMAGE}:${GITHUB_REF_NAME}"
+          echo "Digest ${DIGEST}"
+          {
+            echo "### Published image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| tag | \`${IMAGE}:${GITHUB_REF_NAME}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| pin | \`${IMAGE}@${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -32,15 +32,24 @@ type Info struct {
 	Metadata  map[string]string `json:"metadata,omitempty"`
 	CreatedAt time.Time         `json:"createdAt"`
 	CreatedBy string            `json:"createdBy"`
+	// Application is the Application the object belongs to: the writer's
+	// verified Application, recorded at write and compared at every read.
+	Application string `json:"application"`
+	// Owner is the Dex subject of the Application's owner, as the writer
+	// (the Tenant Control Plane) declared it: the human who may read it
+	// besides the Cell admin.
+	Owner string `json:"owner,omitempty"`
 }
 
 // PutRequest describes an object to write; its content is the reader passed
 // with it.
 type PutRequest struct {
-	Key       string
-	MediaType string
-	Metadata  map[string]string
-	CreatedBy string
+	Key         string
+	MediaType   string
+	Metadata    map[string]string
+	CreatedBy   string
+	Application string
+	Owner       string
 	// SHA256, if set (lowercase hex), must match the content.
 	SHA256 string
 }

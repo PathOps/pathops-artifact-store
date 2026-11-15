@@ -1,68 +1,88 @@
-// Package server is the HTTP API of the Artifact Store.
+// Package server is the HTTP API of the Artifact Store (Decisions 0047, 0061).
 //
-//	GET    /healthz                  liveness (no authentication, no API server call)
-//	POST   /v1/capabilities          privileged: issue an attempt-scoped capability
-//	PUT    /v1/objects/{key}         stream an object in (immutable)
-//	GET    /v1/objects/{key}         stream an object out
-//	HEAD   /v1/objects/{key}         describe an object
-//	DELETE /v1/objects/{key}         privileged: remove an object
+//	GET  /healthz              liveness (no authentication)
+//	PUT  /v1/objects/{key}     workload: stream an object in (immutable)
+//	GET  /v1/objects/{key}     workload: stream an object out
+//	HEAD /v1/objects/{key}     workload: describe an object
+//	GET  /objects/{key}        human: download, after Dex SSO
+//	HEAD /objects/{key}        human: describe
+//	GET  /oauth2/callback      human: the end of a Dex sign-in
 //
-// Every /v1 request carries "Authorization: Bearer <ServiceAccount token for
-// the store's audience>". A privileged subject (the Tenant Control Plane) may
-// do everything. Any other workload also needs "X-PathOps-Capability", issued
-// for exactly its own subject, whose prefix contains the key and whose
-// operations include the request's (put, get, or stat for HEAD).
+// Workload requests carry "Authorization: Bearer <Artifact Store token>", a
+// JWT Dex issues to an Application's artifact identity (internal/workload).
+// The token names exactly one Application; a request never does:
+//
+//   - PUT needs the write operation and a key under
+//     applications/<the token's Application>/; the object records that
+//     Application;
+//   - GET and HEAD need the read operation and an object that recorded the
+//     token's Application. The key's prefix is checked too, as a second
+//     defense, but the recorded Application is the boundary.
+//
+// Human requests carry no token: the store signs the person in with the
+// Cell's Dex (internal/human) and keeps a session cookie. An object is
+// returned to the Cell admin (a configured, verified email) and to the
+// owner of the object's Application (the Dex subject its writer recorded);
+// anyone else signed in gets 403.
 //
 // Keys are taken from the raw request path, never from a cleaned one, so
 // "..", "//" and percent-encoding are rejected (400) rather than resolved.
+// There is no LIST and no DELETE.
 package server
 
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
+	"html"
 	"io"
 	"log/slog"
 	"mime"
 	"net/http"
+	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/PathOps/pathops-artifact-store/internal/auth"
-	"github.com/PathOps/pathops-artifact-store/internal/capability"
+	"github.com/PathOps/pathops-artifact-store/internal/human"
 	"github.com/PathOps/pathops-artifact-store/internal/key"
 	"github.com/PathOps/pathops-artifact-store/internal/store"
+	"github.com/PathOps/pathops-artifact-store/internal/workload"
 )
 
 // Request and response headers.
 const (
-	HeaderCapability = "X-PathOps-Capability"
-	HeaderSHA256     = "X-PathOps-SHA256"
-	HeaderMetadata   = "X-PathOps-Metadata"
-	HeaderCreatedAt  = "X-PathOps-Created-At"
-	objectsPath      = "/v1/objects/"
-	maxMetadata      = 2048
-	maxMetaEntries   = 16
+	HeaderSHA256    = "X-PathOps-SHA256"
+	HeaderMetadata  = "X-PathOps-Metadata"
+	HeaderCreatedAt = "X-PathOps-Created-At"
+	// HeaderOwner is the Dex subject of the Application's owner, declared by
+	// the writer on PUT.
+	HeaderOwner     = "X-PathOps-Owner"
+	HeaderApp       = "X-PathOps-Application"
+	apiObjectsPath  = "/v1/objects/"
+	humanObjectPath = "/objects/"
+	maxMetadata     = 2048
+	maxMetaEntries  = 16
+	maxOwner        = 256
 )
 
 var (
-	subjectRe = regexp.MustCompile(`^system:serviceaccount:[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?:[a-z0-9]([-.a-z0-9]{0,251}[a-z0-9])?$`)
 	sha256Re  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	metaKeyRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	ownerRe   = regexp.MustCompile(`^[\x21-\x7e]+$`)
 )
 
 // Server serves the API.
 type Server struct {
-	Name           string // the store's name in references: pathops-artifact://<Name>/<key>
-	Store          store.ArtifactStore
-	Auth           auth.Authenticator
-	Signer         *capability.Signer
-	Admins         map[string]bool // privileged ServiceAccount subjects
+	Name     string // the store's name in references: pathops-artifact://<Name>/<key>
+	Store    store.ArtifactStore
+	Workload *workload.Verifier
+	Human    *human.Auth
+	// Admins are the Cell admin's emails: they read every object.
+	Admins         []string
 	MaxObjectBytes int64
-	MaxTTL         time.Duration
 	RequestTimeout time.Duration
 	Log            *slog.Logger
 }
@@ -74,23 +94,6 @@ func (s *Server) Ref(k string) string { return "pathops-artifact://" + s.Name + 
 type PutResponse struct {
 	Ref string `json:"ref"`
 	store.Info
-}
-
-// CapabilityRequest is the body of POST /v1/capabilities.
-type CapabilityRequest struct {
-	Subject    string   `json:"subject"`
-	Prefix     string   `json:"prefix"`
-	Operations []string `json:"operations"`
-	TTLSeconds int64    `json:"ttlSeconds"`
-}
-
-// CapabilityResponse is its answer.
-type CapabilityResponse struct {
-	Capability string    `json:"capability"`
-	Subject    string    `json:"subject"`
-	Prefix     string    `json:"prefix"`
-	Operations []string  `json:"operations"`
-	ExpiresAt  time.Time `json:"expiresAt"`
 }
 
 type statusWriter struct {
@@ -110,17 +113,18 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 }
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// reqLog collects what one request log line says. It never holds a token or
-// a capability.
+// reqLog collects what one request log line says. It never holds a token, a
+// code or a cookie.
 type reqLog struct {
-	op, key, subject, err string
-	in                    int64
+	op, key, subject, application, err string
+	in                                 int64
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	w := &statusWriter{ResponseWriter: rw}
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	l := &reqLog{}
 	s.route(w, r, l)
 	if r.URL.Path == "/healthz" {
@@ -128,9 +132,9 @@ func (s *Server) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 	var ru syscall.Rusage
 	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	s.Log.Info("request", "method", r.Method, "op", l.op, "key", l.key, "subject", l.subject, "status", w.status,
-		"bytesIn", l.in, "bytesOut", w.bytes, "durationMs", time.Since(start).Milliseconds(), "error", l.err,
-		"processMaxRssKiB", ru.Maxrss, "processCpuMs", (ru.Utime.Nano()+ru.Stime.Nano())/1e6)
+	s.Log.Info("request", "method", r.Method, "op", l.op, "key", l.key, "subject", l.subject, "application", l.application,
+		"status", w.status, "bytesIn", l.in, "bytesOut", w.bytes, "durationMs", time.Since(start).Milliseconds(), "error", l.err,
+		"processMaxRssKiB", ru.Maxrss)
 }
 
 func (s *Server) route(w *statusWriter, r *http.Request, l *reqLog) {
@@ -138,15 +142,12 @@ func (s *Server) route(w *statusWriter, r *http.Request, l *reqLog) {
 	switch {
 	case p == "/healthz" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	case p == "/v1/capabilities":
-		l.op = "issue"
-		if r.Method != http.MethodPost {
-			s.fail(w, l, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		s.issue(w, r, l)
-	case strings.HasPrefix(p, objectsPath):
-		s.object(w, r, l, strings.TrimPrefix(p, objectsPath))
+	case strings.HasPrefix(p, apiObjectsPath):
+		s.apiObject(w, r, l, strings.TrimPrefix(p, apiObjectsPath))
+	case strings.HasPrefix(p, humanObjectPath):
+		s.humanObject(w, r, l, strings.TrimPrefix(p, humanObjectPath))
+	case p == human.CallbackPath && r.Method == http.MethodGet:
+		s.callback(w, r, l)
 	default:
 		s.fail(w, l, http.StatusNotFound, "not found")
 	}
@@ -163,154 +164,74 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// authenticate returns the caller, or writes 401/503.
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request, l *reqLog) (auth.Principal, bool) {
-	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if !ok || tok == "" {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="pathops-artifact-store"`)
-		s.fail(w, l, http.StatusUnauthorized, "a ServiceAccount bearer token for the store's audience is required")
-		return auth.Principal{}, false
-	}
-	p, err := s.Auth.Authenticate(r.Context(), tok)
-	switch {
-	case errors.Is(err, auth.ErrUnauthenticated):
-		w.Header().Set("WWW-Authenticate", `Bearer realm="pathops-artifact-store", error="invalid_token"`)
-		s.fail(w, l, http.StatusUnauthorized, "invalid, expired or wrong-audience token")
-		return auth.Principal{}, false
-	case err != nil:
-		s.Log.Error("token review failed", "error", err)
-		s.fail(w, l, http.StatusServiceUnavailable, "cannot verify the token now")
-		return auth.Principal{}, false
-	}
-	l.subject = p.Subject
-	return p, true
+// validKey: raw is a key as the path spelled it, with nothing to resolve.
+func validKey(r *http.Request, raw string) bool {
+	return !strings.Contains(raw, "%") && key.Validate(raw) == nil && r.URL.RawQuery == ""
 }
 
-// authorize decides op on k for p, or writes 403.
-func (s *Server) authorize(w http.ResponseWriter, r *http.Request, l *reqLog, p auth.Principal, op, k string) bool {
-	if s.Admins[p.Subject] {
-		return true
+// applicationOf is the Application segment of an applications/<id>/... key.
+func applicationOf(k string) string {
+	seg := strings.Split(k, "/")
+	if len(seg) < 3 || seg[0] != "applications" {
+		return ""
 	}
-	enc := r.Header.Get(HeaderCapability)
-	if enc == "" || op == "delete" {
-		s.fail(w, l, http.StatusForbidden, "not allowed")
-		return false
-	}
-	c, err := s.Signer.Verify(enc)
-	switch {
-	case errors.Is(err, capability.ErrExpired):
-		s.fail(w, l, http.StatusForbidden, "capability expired")
-		return false
-	case err != nil:
-		s.fail(w, l, http.StatusForbidden, "invalid capability")
-		return false
-	case c.Subject != p.Subject:
-		s.fail(w, l, http.StatusForbidden, "capability issued for another identity")
-		return false
-	case !key.Within(k, c.Prefix) || !(c.Allows(op) || op == capability.OpStat && c.Allows(capability.OpGet)):
-		s.fail(w, l, http.StatusForbidden, "capability does not allow this operation on this key")
-		return false
-	}
-	return true
+	return seg[1]
 }
 
-func (s *Server) issue(w http.ResponseWriter, r *http.Request, l *reqLog) {
-	p, ok := s.authenticate(w, r, l)
-	if !ok {
-		return
-	}
-	if !s.Admins[p.Subject] {
-		s.fail(w, l, http.StatusForbidden, "only a privileged identity may issue capabilities")
-		return
-	}
-	var req CapabilityRequest
-	dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		s.fail(w, l, http.StatusBadRequest, "invalid capability request")
-		return
-	}
-	ttl := time.Duration(req.TTLSeconds) * time.Second
-	switch {
-	case !subjectRe.MatchString(req.Subject):
-		s.fail(w, l, http.StatusBadRequest, "subject must be system:serviceaccount:<namespace>:<name>")
-		return
-	case s.Admins[req.Subject]:
-		s.fail(w, l, http.StatusBadRequest, "a privileged identity needs no capability")
-		return
-	case key.ValidatePrefix(req.Prefix, 2) != nil:
-		s.fail(w, l, http.StatusBadRequest, "prefix must be at least two key segments followed by /")
-		return
-	case !capability.ValidOperations(req.Operations):
-		s.fail(w, l, http.StatusBadRequest, "operations must be a set of put, get, stat")
-		return
-	case ttl <= 0 || ttl > s.MaxTTL:
-		s.fail(w, l, http.StatusBadRequest, fmt.Sprintf("ttlSeconds must be between 1 and %d", int64(s.MaxTTL/time.Second)))
-		return
-	}
-	enc, c, err := s.Signer.Issue(req.Subject, req.Prefix, req.Operations, ttl)
-	if err != nil {
-		s.fail(w, l, http.StatusInternalServerError, "cannot issue")
-		return
-	}
-	l.key = req.Prefix
-	s.Log.Info("capability issued", "by", p.Subject, "subject", c.Subject, "prefix", c.Prefix, "operations", c.Operations,
-		"expiresAt", time.Unix(c.Expires, 0).UTC())
-	writeJSON(w, http.StatusCreated, CapabilityResponse{Capability: enc, Subject: c.Subject, Prefix: c.Prefix,
-		Operations: c.Operations, ExpiresAt: time.Unix(c.Expires, 0).UTC()})
-}
+// ---------------------------------------------------------------- workloads
 
-func (s *Server) object(w *statusWriter, r *http.Request, l *reqLog, raw string) {
+func (s *Server) apiObject(w *statusWriter, r *http.Request, l *reqLog, raw string) {
 	var op string
 	switch r.Method {
 	case http.MethodPut:
-		op = capability.OpPut
+		l.op, op = "put", workload.OpWrite
 	case http.MethodGet:
-		op = capability.OpGet
+		l.op, op = "get", workload.OpRead
 	case http.MethodHead:
-		op = capability.OpStat
-	case http.MethodDelete:
-		op = "delete"
+		l.op, op = "stat", workload.OpRead
 	default:
 		l.op = strings.ToLower(r.Method)
 		s.fail(w, l, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	l.op = op
-	p, ok := s.authenticate(w, r, l)
-	if !ok {
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || tok == "" {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="pathops-artifact-store"`)
+		s.fail(w, l, http.StatusUnauthorized, "an Artifact Store token is required")
 		return
 	}
-	if strings.Contains(raw, "%") || key.Validate(raw) != nil || r.URL.RawQuery != "" {
+	p, err := s.Workload.Verify(tok)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="pathops-artifact-store", error="invalid_token"`)
+		s.Log.Warn("token refused", "reason", err.Error())
+		s.fail(w, l, http.StatusUnauthorized, "invalid, expired, wrong-issuer or wrong-audience token")
+		return
+	}
+	l.subject, l.application = p.Subject, p.Application
+	if !validKey(r, raw) {
 		s.fail(w, l, http.StatusBadRequest, "invalid key")
 		return
 	}
 	l.key = raw
-	if !s.authorize(w, r, l, p, op, raw) {
+	switch {
+	case !p.Allows(op):
+		s.fail(w, l, http.StatusForbidden, "the token does not allow this operation")
+		return
+	case applicationOf(raw) != p.Application:
+		s.fail(w, l, http.StatusForbidden, "the key is not under the token's Application")
 		return
 	}
 	rc := http.NewResponseController(w)
-	switch op {
-	case capability.OpPut:
+	if op == workload.OpWrite {
 		_ = rc.SetReadDeadline(time.Now().Add(s.RequestTimeout))
 		s.put(w, r, l, p, raw)
-	case capability.OpGet, capability.OpStat:
-		_ = rc.SetWriteDeadline(time.Now().Add(s.RequestTimeout))
-		s.get(w, r, l, raw, op == capability.OpGet)
-	case "delete":
-		switch err := s.Store.Delete(r.Context(), raw); {
-		case errors.Is(err, store.ErrNotFound):
-			s.fail(w, l, http.StatusNotFound, "not found")
-		case err != nil:
-			s.Log.Error("delete failed", "key", raw, "error", err)
-			s.fail(w, l, http.StatusInternalServerError, "delete failed")
-		default:
-			w.WriteHeader(http.StatusNoContent)
-		}
+		return
 	}
+	_ = rc.SetWriteDeadline(time.Now().Add(s.RequestTimeout))
+	s.serve(w, r, l, raw, func(info store.Info) bool { return info.Application == p.Application }, false)
 }
 
-func (s *Server) put(w http.ResponseWriter, r *http.Request, l *reqLog, p auth.Principal, k string) {
+func (s *Server) put(w http.ResponseWriter, r *http.Request, l *reqLog, p workload.Principal, k string) {
 	mt := r.Header.Get("Content-Type")
 	if mt == "" {
 		mt = "application/octet-stream"
@@ -324,6 +245,11 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request, l *reqLog, p auth.P
 		s.fail(w, l, http.StatusBadRequest, "X-PathOps-SHA256 must be 64 lowercase hex characters")
 		return
 	}
+	owner := r.Header.Get(HeaderOwner)
+	if owner != "" && (len(owner) > maxOwner || !ownerRe.MatchString(owner)) {
+		s.fail(w, l, http.StatusBadRequest, "invalid X-PathOps-Owner")
+		return
+	}
 	meta, err := parseMetadata(r.Header.Get(HeaderMetadata))
 	if err != nil {
 		s.fail(w, l, http.StatusBadRequest, err.Error())
@@ -334,7 +260,8 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request, l *reqLog, p auth.P
 		return
 	}
 	body := &countingReader{r: http.MaxBytesReader(w, r.Body, s.MaxObjectBytes)}
-	info, created, err := s.Store.Put(r.Context(), store.PutRequest{Key: k, MediaType: mt, Metadata: meta, CreatedBy: p.Subject, SHA256: sum}, body)
+	info, created, err := s.Store.Put(r.Context(), store.PutRequest{Key: k, MediaType: mt, Metadata: meta, CreatedBy: p.Subject,
+		Application: p.Application, Owner: owner, SHA256: sum}, body)
 	l.in = body.n
 	var tooLarge *http.MaxBytesError
 	switch {
@@ -354,16 +281,23 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request, l *reqLog, p auth.P
 	}
 }
 
-func (s *Server) get(w http.ResponseWriter, r *http.Request, l *reqLog, k string, body bool) {
+// serve answers GET or HEAD of k when allowed(info). Otherwise a workload
+// gets 404, as for an object that does not exist (no existence oracle across
+// Applications), and a signed-in person 403. download: a person's request
+// (Content-Disposition attachment).
+func (s *Server) serve(w http.ResponseWriter, r *http.Request, l *reqLog, k string, allowed func(store.Info) bool, download bool) {
 	var (
 		info store.Info
 		rc   io.ReadCloser
 		err  error
 	)
-	if body {
+	if r.Method == http.MethodGet {
 		info, rc, err = s.Store.Get(r.Context(), k)
 	} else {
 		info, err = s.Store.Stat(r.Context(), k)
+	}
+	if rc != nil {
+		defer rc.Close()
 	}
 	switch {
 	case errors.Is(err, store.ErrNotFound):
@@ -373,6 +307,13 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, l *reqLog, k string
 		s.Log.Error("read failed", "key", k, "error", err)
 		s.fail(w, l, http.StatusInternalServerError, "read failed")
 		return
+	case !allowed(info) && download:
+		s.page(w, l, http.StatusForbidden, "Not allowed", "This artifact belongs to an Application you do not own.")
+		return
+	case !allowed(info):
+		l.err = "not this identity's object"
+		s.fail(w, l, http.StatusNotFound, "not found")
+		return
 	}
 	h := w.Header()
 	h.Set("Content-Type", info.MediaType)
@@ -380,18 +321,81 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, l *reqLog, k string
 	h.Set(HeaderSHA256, info.SHA256)
 	h.Set("ETag", `"sha256:`+info.SHA256+`"`)
 	h.Set(HeaderCreatedAt, info.CreatedAt.Format(time.RFC3339Nano))
+	h.Set(HeaderApp, info.Application)
 	if len(info.Metadata) > 0 {
 		b, _ := json.Marshal(info.Metadata)
 		h.Set(HeaderMetadata, string(b))
+	}
+	if download {
+		h.Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(k)}))
 	}
 	w.WriteHeader(http.StatusOK)
 	if rc == nil {
 		return
 	}
-	defer rc.Close()
 	if _, err := io.CopyBuffer(w, rc, make([]byte, 32<<10)); err != nil {
 		l.err = "client stopped reading"
 	}
+}
+
+// ---------------------------------------------------------------- humans
+
+func (s *Server) humanObject(w *statusWriter, r *http.Request, l *reqLog, raw string) {
+	l.op = "download"
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		s.fail(w, l, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !validKey(r, raw) || applicationOf(raw) == "" {
+		s.fail(w, l, http.StatusBadRequest, "invalid key")
+		return
+	}
+	l.key = raw
+	id, ok := s.Human.Session(r)
+	if !ok {
+		l.op = "sign-in"
+		if err := s.Human.Login(r.Context(), w, humanObjectPath+raw); err != nil {
+			s.Log.Error("sign-in unavailable", "error", err)
+			s.page(w, l, http.StatusServiceUnavailable, "Sign-in is unavailable", "The Cell's identity provider cannot be reached now. Try again later.")
+		}
+		return
+	}
+	l.subject = id.Subject
+	admin := id.EmailVerified && slices.Contains(s.Admins, id.Email)
+	s.serve(w, r, l, raw, func(info store.Info) bool {
+		l.application = info.Application
+		return admin || (info.Owner != "" && info.Owner == id.Subject)
+	}, true)
+}
+
+func (s *Server) callback(w *statusWriter, r *http.Request, l *reqLog) {
+	l.op = "sign-in"
+	next, err := s.Human.Callback(r.Context(), w, r)
+	switch {
+	case errors.Is(err, human.ErrUnavailable):
+		s.Log.Error("sign-in unavailable", "error", err)
+		s.page(w, l, http.StatusServiceUnavailable, "Sign-in is unavailable", "The Cell's identity provider cannot be reached now. Try again later.")
+		return
+	case err != nil:
+		s.Log.Warn("sign-in refused", "reason", err.Error())
+		s.page(w, l, http.StatusUnauthorized, "Sign-in failed", "Open the artifact link again to sign in.")
+		return
+	}
+	if !strings.HasPrefix(next, humanObjectPath) {
+		next = "/"
+	}
+	w.Header().Set("Location", next)
+	w.WriteHeader(http.StatusFound)
+}
+
+// page is a minimal HTML answer for a browser.
+func (s *Server) page(w http.ResponseWriter, l *reqLog, status int, title, text string) {
+	l.err = title
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, "<!doctype html><meta charset=utf-8><title>PathOps artifacts</title><h1>"+
+		html.EscapeString(title)+"</h1><p>"+html.EscapeString(text)+"</p>")
 }
 
 func parseMetadata(h string) (map[string]string, error) {

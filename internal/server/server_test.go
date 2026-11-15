@@ -2,83 +2,154 @@ package server
 
 import (
 	"bytes"
-	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/PathOps/pathops-artifact-store/internal/auth"
-	"github.com/PathOps/pathops-artifact-store/internal/capability"
+	jose "github.com/go-jose/go-jose/v4"
+
+	"github.com/PathOps/pathops-artifact-store/internal/human"
 	"github.com/PathOps/pathops-artifact-store/internal/store/fsstore"
+	"github.com/PathOps/pathops-artifact-store/internal/workload"
 )
 
 const (
-	tcp    = "system:serviceaccount:pathops-tcp:tenant-control-plane"
-	appA   = "system:serviceaccount:app-a:app-a-build"
-	appB   = "system:serviceaccount:app-b:app-b-build"
-	prefA  = "applications/app-a/runs/run-1/steps/WAIT_BUILD/attempts/1/"
-	prefB  = "applications/app-b/runs/run-9/steps/WAIT_BUILD/attempts/1/"
-	bundle = "bundle.tar.gz"
+	appA     = "11111111-1111-4111-8111-111111111111"
+	appB     = "22222222-2222-4222-8222-222222222222"
+	tokenIss = "https://dex.cell.example/artifacts"
+	tokenAud = "pathops-artifact-store"
+	clientID = "pathops-artifact-store-web"
+	secret   = "client-secret"
+	ownerA   = "owner-a-subject"
+	ownerB   = "owner-b-subject"
+	admin    = "admin-cell@demo.pathops.io"
 )
 
-// fakeAuth maps tokens to subjects; "down" means the API server is unreachable.
-type fakeAuth map[string]string
+var (
+	keyA = "applications/" + appA + "/deliveries/33333333-3333-4333-8333-333333333333/build-failure.tar.gz"
+	keyB = "applications/" + appB + "/deliveries/44444444-4444-4444-8444-444444444444/build-failure.tar.gz"
+)
 
-func (f fakeAuth) Authenticate(_ context.Context, tok string) (auth.Principal, error) {
-	if tok == "down" {
-		return auth.Principal{}, auth.ErrUnavailable
-	}
-	if s, ok := f[tok]; ok {
-		return auth.Principal{Subject: s}, nil
-	}
-	return auth.Principal{}, auth.ErrUnauthenticated
+// dex is a fake Dex: discovery, JWKS, and an authorization code flow whose
+// codes the test mints (code -> the ID token claims it redeems to).
+type dex struct {
+	srv   *httptest.Server
+	key   *rsa.PrivateKey
+	kid   string
+	mu    sync.Mutex
+	codes map[string]dexCode
+}
+
+type dexCode struct {
+	challenge string
+	claims    map[string]any
+	signer    *rsa.PrivateKey
+}
+
+func newDex(t *testing.T) *dex {
+	d := &dex{kid: "oidc-1", codes: map[string]dexCode{}}
+	d.key, _ = rsa.GenerateKey(rand.Reader, 2048)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": d.srv.URL, "authorization_endpoint": d.srv.URL + "/auth",
+			"token_endpoint": d.srv.URL + "/token", "jwks_uri": d.srv.URL + "/keys"})
+	})
+	mux.HandleFunc("/keys", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &d.key.PublicKey, KeyID: d.kid, Algorithm: "RS256", Use: "sig"}}})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		id, sec, ok := r.BasicAuth()
+		_ = r.ParseForm()
+		d.mu.Lock()
+		c, found := d.codes[r.Form.Get("code")]
+		delete(d.codes, r.Form.Get("code"))
+		d.mu.Unlock()
+		sum := sha256.Sum256([]byte(r.Form.Get("code_verifier")))
+		if !ok || id != clientID || sec != secret || !found || base64.RawURLEncoding.EncodeToString(sum[:]) != c.challenge ||
+			r.Form.Get("grant_type") != "authorization_code" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"id_token": d.sign(c.signer, c.claims), "token_type": "bearer"})
+	})
+	d.srv = httptest.NewTLSServer(mux)
+	t.Cleanup(d.srv.Close)
+	return d
+}
+
+func (d *dex) sign(k *rsa.PrivateKey, claims map[string]any) string {
+	s, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: k}, (&jose.SignerOptions{}).WithHeader("kid", d.kid))
+	b, _ := json.Marshal(claims)
+	o, _ := s.Sign(b)
+	out, _ := o.CompactSerialize()
+	return out
 }
 
 type env struct {
-	t   *testing.T
-	srv *httptest.Server
-	log bytes.Buffer
+	t        *testing.T
+	srv      *httptest.Server
+	dex      *dex
+	tokenKey ed25519.PrivateKey
 }
 
 func newEnv(t *testing.T) *env {
-	t.Helper()
 	st, err := fsstore.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { st.Close() })
-	signer, _ := capability.NewSigner(bytes.Repeat([]byte{1}, 32))
-	e := &env{t: t}
-	s := &Server{Name: "dev", Store: st, Auth: fakeAuth{"tcp": tcp, "a": appA, "b": appB}, Signer: signer,
-		Admins: map[string]bool{tcp: true}, MaxObjectBytes: 1 << 20, MaxTTL: time.Hour, RequestTimeout: time.Minute,
-		Log: slog.New(slog.NewJSONHandler(&e.log, nil))}
+	t.Cleanup(func() { _ = st.Close() })
+	pub, key, _ := ed25519.GenerateKey(rand.Reader)
+	d := newDex(t)
+	e := &env{t: t, dex: d, tokenKey: key}
+	s := &Server{Name: "dev", Store: st, Admins: []string{admin}, MaxObjectBytes: 1 << 20, RequestTimeout: time.Minute,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Workload: &workload.Verifier{Issuer: tokenIss, Audience: tokenAud, KeyID: "artifact-1", Key: pub, Now: time.Now}}
 	e.srv = httptest.NewTLSServer(s)
 	t.Cleanup(e.srv.Close)
+	s.Human, err = human.New(human.Config{Issuer: d.srv.URL, ClientID: clientID, ClientSecret: secret, PublicURL: e.srv.URL,
+		HTTP: d.srv.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return e
 }
 
-// do sends a request; path is sent as written (no cleaning).
-func (e *env) do(method, path, token, capab string, body []byte, hdr ...string) (*http.Response, []byte) {
-	e.t.Helper()
-	req, err := http.NewRequest(method, e.srv.URL+path, bytes.NewReader(body))
-	if err != nil {
-		e.t.Fatal(err)
+// token is an Artifact Store token of app as Dex issues it.
+func (e *env) token(app string, ops ...string) string {
+	return e.tokenWith(map[string]any{"pathops_application": app, "pathops_operations": ops})
+}
+
+func (e *env) tokenWith(over map[string]any) string {
+	now := time.Now().Unix()
+	c := map[string]any{"iss": tokenIss, "aud": tokenAud, "sub": "system:serviceaccount:app-a-ci:app-a-artifact",
+		"iat": now, "nbf": now, "exp": now + 300, "pathops_application": appA, "pathops_operations": []string{"read", "write"}}
+	for k, v := range over {
+		c[k] = v
 	}
-	if body == nil {
-		req.Body = nil
-	}
+	h, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": "artifact-1"})
+	b, _ := json.Marshal(c)
+	in := base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(b)
+	return in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(e.tokenKey, []byte(in)))
+}
+
+func (e *env) api(method, key, token string, body []byte, hdr ...string) (*http.Response, []byte) {
+	req, _ := http.NewRequest(method, e.srv.URL+"/v1/objects/"+key, bytes.NewReader(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	if capab != "" {
-		req.Header.Set(HeaderCapability, capab)
 	}
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
@@ -87,149 +158,131 @@ func (e *env) do(method, path, token, capab string, body []byte, hdr ...string) 
 	if err != nil {
 		e.t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 	return resp, b
-}
-
-func (e *env) capability(subject, prefix string, ttl int64, ops ...string) string {
-	e.t.Helper()
-	body, _ := json.Marshal(CapabilityRequest{Subject: subject, Prefix: prefix, Operations: ops, TTLSeconds: ttl})
-	resp, b := e.do(http.MethodPost, "/v1/capabilities", "tcp", "", body)
-	if resp.StatusCode != http.StatusCreated {
-		e.t.Fatalf("issue: %d %s", resp.StatusCode, b)
-	}
-	var c CapabilityResponse
-	_ = json.Unmarshal(b, &c)
-	return c.Capability
 }
 
 func sum(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
 
-func TestAttemptScopedFlow(t *testing.T) {
-	e := newEnv(t)
-	content := bytes.Repeat([]byte("evidence "), 1000)
-	capA := e.capability(appA, prefA, 600, capability.OpPut, capability.OpGet)
+// put stores body at key as app (owner recorded) and fails the test otherwise.
+func (e *env) put(app, key, owner string, body []byte) {
+	e.t.Helper()
+	if resp, b := e.api(http.MethodPut, key, e.token(app, "read", "write"), body, "Content-Type", "application/gzip",
+		HeaderSHA256, sum(body), HeaderOwner, owner); resp.StatusCode != http.StatusCreated {
+		e.t.Fatalf("put %s: %d %s", key, resp.StatusCode, b)
+	}
+}
 
-	resp, b := e.do(http.MethodPut, "/v1/objects/"+prefA+bundle, "a", capA, content,
-		"Content-Type", "application/gzip", HeaderSHA256, sum(content), HeaderMetadata, `{"producer":"tekton"}`)
+func TestWorkloadApplicationIsolation(t *testing.T) {
+	e := newEnv(t)
+	bundle := []byte("bundle of A")
+	resp, b := e.api(http.MethodPut, keyA, e.token(appA, "read", "write"), bundle, "Content-Type", "application/gzip",
+		HeaderSHA256, sum(bundle), HeaderOwner, ownerA, HeaderMetadata, `{"type":"BUILD_FAILURE_LOGS"}`)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("%d %s", resp.StatusCode, b)
+		t.Fatal(resp.StatusCode, string(b))
 	}
 	var put PutResponse
 	_ = json.Unmarshal(b, &put)
-	if put.Ref != "pathops-artifact://dev/"+prefA+bundle || put.SHA256 != sum(content) || put.Size != int64(len(content)) || put.CreatedBy != appA {
-		t.Fatalf("%s", b)
+	if put.Ref != "pathops-artifact://dev/"+keyA || put.SHA256 != sum(bundle) || put.Size != int64(len(bundle)) || put.Application != appA ||
+		put.Owner != ownerA || put.CreatedBy != "system:serviceaccount:app-a-ci:app-a-artifact" {
+		t.Fatalf("%+v", put)
 	}
+	e.put(appB, keyB, ownerB, []byte("bundle of B"))
 
-	resp, got := e.do(http.MethodGet, "/v1/objects/"+prefA+bundle, "a", capA, nil)
-	if resp.StatusCode != http.StatusOK || !bytes.Equal(got, content) || resp.Header.Get(HeaderSHA256) != sum(content) ||
-		resp.Header.Get("Content-Type") != "application/gzip" || resp.Header.Get(HeaderMetadata) != `{"producer":"tekton"}` {
-		t.Fatalf("%d %v", resp.StatusCode, resp.Header)
+	// App A token: get A ALLOW, with the recorded facts.
+	resp, b = e.api(http.MethodGet, keyA, e.token(appA, "read", "write"), nil)
+	if resp.StatusCode != http.StatusOK || string(b) != string(bundle) || resp.Header.Get(HeaderSHA256) != sum(bundle) ||
+		resp.Header.Get(HeaderApp) != appA || resp.Header.Get("Content-Length") != "11" {
+		t.Fatal(resp.StatusCode, resp.Header)
 	}
-	// HEAD needs no body and is allowed by get.
-	if resp, b := e.do(http.MethodHead, "/v1/objects/"+prefA+bundle, "a", capA, nil); resp.StatusCode != http.StatusOK || len(b) != 0 ||
-		resp.ContentLength != int64(len(content)) {
+	if resp, _ := e.api(http.MethodHead, keyA, e.token(appA, "read"), nil); resp.StatusCode != http.StatusOK {
 		t.Fatal(resp.StatusCode)
 	}
-	// The privileged identity reads by the stored reference, with no capability.
-	key := strings.TrimPrefix(put.Ref, "pathops-artifact://dev/")
-	if resp, got := e.do(http.MethodGet, "/v1/objects/"+key, "tcp", "", nil); resp.StatusCode != http.StatusOK || !bytes.Equal(got, content) {
-		t.Fatal(resp.StatusCode)
-	}
-	// A retry with the same content is the same object; other content is a conflict.
-	if resp, _ := e.do(http.MethodPut, "/v1/objects/"+prefA+bundle, "a", capA, content); resp.StatusCode != http.StatusOK {
-		t.Fatal(resp.StatusCode)
-	}
-	if resp, _ := e.do(http.MethodPut, "/v1/objects/"+prefA+bundle, "a", capA, []byte("other")); resp.StatusCode != http.StatusConflict {
-		t.Fatal(resp.StatusCode)
-	}
-	// Only the privileged identity deletes.
-	if resp, _ := e.do(http.MethodDelete, "/v1/objects/"+prefA+bundle, "a", capA, nil); resp.StatusCode != http.StatusForbidden {
-		t.Fatal(resp.StatusCode)
-	}
-	if resp, _ := e.do(http.MethodDelete, "/v1/objects/"+prefA+bundle, "tcp", "", nil); resp.StatusCode != http.StatusNoContent {
-		t.Fatal(resp.StatusCode)
-	}
-	if resp, _ := e.do(http.MethodGet, "/v1/objects/"+prefA+bundle, "tcp", "", nil); resp.StatusCode != http.StatusNotFound {
-		t.Fatal(resp.StatusCode)
-	}
-
-	// Nothing a client sent as a secret reaches the log.
-	if strings.Contains(e.log.String(), capA) || strings.Contains(e.log.String(), "Bearer") {
-		t.Fatal("a credential was logged")
-	}
-}
-
-func TestIsolation(t *testing.T) {
-	e := newEnv(t)
-	capA := e.capability(appA, prefA, 600, capability.OpPut, capability.OpGet)
-	capB := e.capability(appB, prefB, 600, capability.OpPut, capability.OpGet)
-	if resp, _ := e.do(http.MethodPut, "/v1/objects/"+prefB+bundle, "b", capB, []byte("b's evidence")); resp.StatusCode != http.StatusCreated {
-		t.Fatal(resp.StatusCode)
-	}
+	// App A token: get or put B DENY; App B token: A DENY.
 	for name, c := range map[string]struct {
-		method, path, token, capab string
-		want                       int
+		method, key, token string
 	}{
-		"A reads B's object":                    {http.MethodGet, prefB + bundle, "a", capA, 403},
-		"A writes under B's prefix":             {http.MethodPut, prefB + "x", "a", capA, 403},
-		"A uses B's (stolen) capability":        {http.MethodGet, prefB + bundle, "a", capB, 403},
-		"A writes to another attempt":           {http.MethodPut, "applications/app-a/runs/run-1/steps/WAIT_BUILD/attempts/2/x", "a", capA, 403},
-		"A writes to attempt 10 (prefix trick)": {http.MethodPut, "applications/app-a/runs/run-1/steps/WAIT_BUILD/attempts/10/x", "a", capA, 403},
-		"A without a capability":                {http.MethodPut, prefA + bundle, "a", "", 403},
-		"A with a garbage capability":           {http.MethodPut, prefA + bundle, "a", "v1.e30.AAAA", 403},
-		"no token":                              {http.MethodGet, prefB + bundle, "", capB, 401},
-		"unknown token":                         {http.MethodGet, prefB + bundle, "forged", capB, 401},
-		"API server unavailable":                {http.MethodGet, prefB + bundle, "down", capB, 503},
+		"A gets B":  {http.MethodGet, keyB, e.token(appA, "read", "write")},
+		"A heads B": {http.MethodHead, keyB, e.token(appA, "read", "write")},
+		"A puts B":  {http.MethodPut, "applications/" + appB + "/deliveries/x/evil.tar.gz", e.token(appA, "read", "write")},
+		"B gets A":  {http.MethodGet, keyA, e.token(appB, "read", "write")},
+		"B puts A":  {http.MethodPut, "applications/" + appA + "/deliveries/x/evil.tar.gz", e.token(appB, "read", "write")},
+		// A key outside applications/<id>/ belongs to no Application.
+		"A puts outside":  {http.MethodPut, "shared/evil.tar.gz", e.token(appA, "read", "write")},
+		"A puts at root":  {http.MethodPut, "applications/" + appA, e.token(appA, "read", "write")},
+		"read-only puts":  {http.MethodPut, "applications/" + appA + "/deliveries/x/y.tar.gz", e.token(appA, "read")},
+		"write-only gets": {http.MethodGet, keyA, e.token(appA, "write")},
 	} {
-		if resp, b := e.do(c.method, "/v1/objects/"+c.path, c.token, c.capab, []byte("x")); resp.StatusCode != c.want {
+		if resp, b := e.api(c.method, c.key, c.token, []byte("evil")); resp.StatusCode != http.StatusForbidden {
 			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
 		}
 	}
-	// A get-only capability does not allow put.
-	ro := e.capability(appA, prefA, 600, capability.OpGet)
-	if resp, _ := e.do(http.MethodPut, "/v1/objects/"+prefA+bundle, "a", ro, []byte("x")); resp.StatusCode != 403 {
-		t.Fatal(resp.StatusCode)
+	// B's object is unchanged.
+	if resp, b := e.api(http.MethodGet, keyB, e.token(appB, "read"), nil); resp.StatusCode != http.StatusOK || string(b) != "bundle of B" {
+		t.Fatal(resp.StatusCode, string(b))
 	}
 }
 
-func TestCapabilityIssuing(t *testing.T) {
+func TestWorkloadTokensRefused(t *testing.T) {
 	e := newEnv(t)
-	// Only the privileged identity issues.
-	body, _ := json.Marshal(CapabilityRequest{Subject: appA, Prefix: prefB, Operations: []string{"put"}, TTLSeconds: 60})
-	if resp, _ := e.do(http.MethodPost, "/v1/capabilities", "a", "", body); resp.StatusCode != http.StatusForbidden {
-		t.Fatal(resp.StatusCode)
-	}
-	for name, req := range map[string]CapabilityRequest{
-		"human subject":       {Subject: "alice@example.com", Prefix: prefA, Operations: []string{"put"}, TTLSeconds: 60},
-		"whole store":         {Subject: appA, Prefix: "applications/", Operations: []string{"put"}, TTLSeconds: 60},
-		"traversal prefix":    {Subject: appA, Prefix: "applications/../", Operations: []string{"put"}, TTLSeconds: 60},
-		"delete operation":    {Subject: appA, Prefix: prefA, Operations: []string{"delete"}, TTLSeconds: 60},
-		"too long":            {Subject: appA, Prefix: prefA, Operations: []string{"put"}, TTLSeconds: 7200},
-		"privileged subject":  {Subject: tcp, Prefix: prefA, Operations: []string{"put"}, TTLSeconds: 60},
-		"no operations":       {Subject: appA, Prefix: prefA, TTLSeconds: 60},
-		"prefix without root": {Subject: appA, Prefix: "applications/app-a", Operations: []string{"put"}, TTLSeconds: 60},
+	e.put(appA, keyA, ownerA, []byte("x"))
+	now := time.Now().Unix()
+	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	h, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": "artifact-1"})
+	b, _ := json.Marshal(map[string]any{"iss": tokenIss, "aud": tokenAud, "sub": "x", "iat": now, "exp": now + 300,
+		"pathops_application": appA, "pathops_operations": []string{"read"}})
+	in := base64.RawURLEncoding.EncodeToString(h) + "." + base64.RawURLEncoding.EncodeToString(b)
+	forged := in + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(otherKey, []byte(in)))
+	valid := e.token(appA, "read")
+	parts := strings.Split(valid, ".")
+	claims, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	widened := base64.RawURLEncoding.EncodeToString(bytes.Replace(claims, []byte(appA), []byte(appB), 1))
+	for name, tok := range map[string]string{
+		"missing":             "",
+		"expired":             e.tokenWith(map[string]any{"iat": now - 400, "nbf": now - 400, "exp": now - 100}),
+		"wrong audience":      e.tokenWith(map[string]any{"aud": "zot"}),
+		"wrong issuer":        e.tokenWith(map[string]any{"iss": "https://dex.other-cell.example/artifacts"}),
+		"missing application": e.tokenWith(map[string]any{"pathops_application": nil}),
+		"wrong operation":     e.tokenWith(map[string]any{"pathops_operations": []string{"admin"}}),
+		"forged":              forged,
+		"tampered":            parts[0] + "." + widened + "." + parts[2],
 	} {
-		body, _ := json.Marshal(req)
-		if resp, b := e.do(http.MethodPost, "/v1/capabilities", "tcp", "", body); resp.StatusCode != http.StatusBadRequest {
+		if resp, b := e.api(http.MethodGet, keyA, tok, nil); resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
 		}
 	}
-	// An expired capability is refused.
-	short := e.capability(appA, prefA, 1, capability.OpPut)
-	time.Sleep(1100 * time.Millisecond)
-	if resp, b := e.do(http.MethodPut, "/v1/objects/"+prefA+bundle, "a", short, []byte("x")); resp.StatusCode != 403 ||
-		!strings.Contains(string(b), "expired") {
-		t.Fatalf("%d %s", resp.StatusCode, b)
+	// A Dex OIDC token (RS256, another key) is no workload credential.
+	idToken := e.dex.sign(e.dex.key, map[string]any{"iss": e.dex.srv.URL, "aud": tokenAud, "sub": ownerA, "exp": now + 300})
+	if resp, _ := e.api(http.MethodGet, keyA, idToken, nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Error("OIDC token accepted:", resp.StatusCode)
+	}
+}
+
+func TestImmutability(t *testing.T) {
+	e := newEnv(t)
+	e.put(appA, keyA, ownerA, []byte("one"))
+	tok := e.token(appA, "read", "write")
+	if resp, _ := e.api(http.MethodPut, keyA, tok, []byte("one"), HeaderOwner, ownerA); resp.StatusCode != http.StatusOK {
+		t.Fatal("identical retry:", resp.StatusCode)
+	}
+	if resp, _ := e.api(http.MethodPut, keyA, tok, []byte("two")); resp.StatusCode != http.StatusConflict {
+		t.Fatal("different content:", resp.StatusCode)
+	}
+	if resp, b := e.api(http.MethodGet, keyA, tok, nil); string(b) != "one" {
+		t.Fatal(resp.StatusCode, string(b))
+	}
+	if resp, _ := e.api(http.MethodDelete, keyA, tok, nil); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatal("delete:", resp.StatusCode)
 	}
 }
 
 func TestKeyEscapes(t *testing.T) {
 	e := newEnv(t)
-	capA := e.capability(appA, prefA, 600, capability.OpPut, capability.OpGet)
+	tok := e.token(appA, "read", "write")
+	prefA := "applications/" + appA + "/"
 	for _, p := range []string{
-		prefA + "../../../../../../app-b/runs/run-9/steps/WAIT_BUILD/attempts/1/x",
+		prefA + "../../applications/" + appB + "/x",
 		prefA + "..%2f..%2fx",
 		prefA + "%2e%2e/x",
 		prefA + "a//b",
@@ -239,7 +292,7 @@ func TestKeyEscapes(t *testing.T) {
 		prefA + ".hidden",
 		prefA,
 	} {
-		if resp, b := e.do(http.MethodPut, "/v1/objects/"+p, "a", capA, []byte("x")); resp.StatusCode != http.StatusBadRequest {
+		if resp, b := e.api(http.MethodPut, p, tok, []byte("x")); resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("%q: %d %s", p, resp.StatusCode, b)
 		}
 	}
@@ -247,28 +300,184 @@ func TestKeyEscapes(t *testing.T) {
 
 func TestPutLimitsAndValidation(t *testing.T) {
 	e := newEnv(t)
-	capA := e.capability(appA, prefA, 600, capability.OpPut)
+	tok := e.token(appA, "write")
 	for name, c := range map[string]struct {
 		body []byte
 		hdr  []string
 		want int
 	}{
-		"too large":            {make([]byte, 1<<20+1), nil, http.StatusRequestEntityTooLarge},
-		"digest mismatch":      {[]byte("x"), []string{HeaderSHA256, sum([]byte("y"))}, http.StatusUnprocessableEntity},
-		"bad digest":           {[]byte("x"), []string{HeaderSHA256, "ABC"}, http.StatusBadRequest},
-		"bad content type":     {[]byte("x"), []string{"Content-Type", "not a type;;"}, http.StatusBadRequest},
-		"bad metadata":         {[]byte("x"), []string{HeaderMetadata, `{"a":1}`}, http.StatusBadRequest},
-		"bad metadata key":     {[]byte("x"), []string{HeaderMetadata, `{"a b":"c"}`}, http.StatusBadRequest},
-		"metadata not an obj.": {[]byte("x"), []string{HeaderMetadata, `[1]`}, http.StatusBadRequest},
+		"too large":        {make([]byte, 1<<20+1), nil, http.StatusRequestEntityTooLarge},
+		"digest mismatch":  {[]byte("x"), []string{HeaderSHA256, sum([]byte("y"))}, http.StatusUnprocessableEntity},
+		"bad digest":       {[]byte("x"), []string{HeaderSHA256, "ABC"}, http.StatusBadRequest},
+		"bad content type": {[]byte("x"), []string{"Content-Type", "not a type;;"}, http.StatusBadRequest},
+		"bad metadata":     {[]byte("x"), []string{HeaderMetadata, `{"a":1}`}, http.StatusBadRequest},
+		"bad owner":        {[]byte("x"), []string{HeaderOwner, "two words"}, http.StatusBadRequest},
 	} {
-		if resp, b := e.do(http.MethodPut, "/v1/objects/"+prefA+strings.ReplaceAll(name, " ", "-"), "a", capA, c.body, c.hdr...); resp.StatusCode != c.want {
+		if resp, b := e.api(http.MethodPut, "applications/"+appA+"/"+strings.ReplaceAll(name, " ", "-"), tok, c.body, c.hdr...); resp.StatusCode != c.want {
 			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
 		}
 	}
-	if resp, _ := e.do(http.MethodPost, "/v1/objects/"+prefA+"x", "a", capA, nil); resp.StatusCode != http.StatusMethodNotAllowed {
+	resp, err := e.srv.Client().Get(e.srv.URL + "/healthz")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatal(resp, err)
+	}
+}
+
+// ---------------------------------------------------------------- humans
+
+// browser follows the store's redirects up to Dex's authorization endpoint
+// and returns its query (state, nonce, PKCE challenge).
+type browser struct {
+	t      *testing.T
+	e      *env
+	client *http.Client
+}
+
+func newBrowser(e *env) *browser {
+	jar, _ := cookiejar.New(nil)
+	c := e.srv.Client()
+	c.Jar = jar
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &browser{t: e.t, e: e, client: c}
+}
+
+func (b *browser) get(u string) (*http.Response, string) {
+	resp, err := b.client.Get(u)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	return resp, string(body)
+}
+
+// signIn opens the object URL, "signs in" at Dex with claims (nil: the
+// defaults for subject) and follows the callback; it returns the final answer.
+func (b *browser) signIn(object, subject, email string, over map[string]any) (*http.Response, string) {
+	b.t.Helper()
+	resp, _ := b.get(b.e.srv.URL + "/objects/" + object)
+	if resp.StatusCode != http.StatusFound {
+		b.t.Fatalf("no redirect to Dex: %d", resp.StatusCode)
+	}
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	q := loc.Query()
+	if loc.Path != "/auth" || q.Get("client_id") != clientID || q.Get("code_challenge_method") != "S256" ||
+		q.Get("redirect_uri") != b.e.srv.URL+"/oauth2/callback" || q.Get("state") == "" || q.Get("nonce") == "" ||
+		!strings.Contains(q.Get("scope"), "openid") {
+		b.t.Fatalf("authorization request: %s", loc)
+	}
+	claims := map[string]any{"iss": b.e.dex.srv.URL, "aud": clientID, "sub": subject, "email": email, "email_verified": true,
+		"exp": time.Now().Unix() + 600, "nonce": q.Get("nonce")}
+	signer := b.e.dex.key
+	for k, v := range over {
+		if k == "signer" {
+			signer = v.(*rsa.PrivateKey)
+			continue
+		}
+		claims[k] = v
+	}
+	code := "code-" + subject + q.Get("state")[:8]
+	b.e.dex.mu.Lock()
+	b.e.dex.codes[code] = dexCode{challenge: q.Get("code_challenge"), claims: claims, signer: signer}
+	b.e.dex.mu.Unlock()
+	resp, body := b.get(b.e.srv.URL + "/oauth2/callback?code=" + code + "&state=" + url.QueryEscape(q.Get("state")))
+	if resp.StatusCode != http.StatusFound {
+		return resp, body
+	}
+	if resp.Header.Get("Location") != "/objects/"+object {
+		b.t.Fatalf("callback goes to %q", resp.Header.Get("Location"))
+	}
+	for _, c := range resp.Cookies() {
+		if c.Name == human.SessionCookie && (!c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || strings.Contains(c.Value, ".")) {
+			b.t.Fatalf("session cookie %+v", c)
+		}
+	}
+	return b.get(b.e.srv.URL + resp.Header.Get("Location"))
+}
+
+func TestHumanUnauthenticatedRedirectsToDex(t *testing.T) {
+	e := newEnv(t)
+	e.put(appA, keyA, ownerA, []byte("A"))
+	resp, body := newBrowser(e).get(e.srv.URL + "/objects/" + keyA)
+	if resp.StatusCode != http.StatusFound || !strings.HasPrefix(resp.Header.Get("Location"), e.dex.srv.URL+"/auth?") || body == "A" {
+		t.Fatal(resp.StatusCode, resp.Header.Get("Location"))
+	}
+	// The API path never redirects: 401 without a bearer token.
+	if resp, _ := e.api(http.MethodGet, keyA, "", nil); resp.StatusCode != http.StatusUnauthorized {
 		t.Fatal(resp.StatusCode)
 	}
-	if resp, _ := e.do(http.MethodGet, "/healthz", "", "", nil); resp.StatusCode != http.StatusOK {
+}
+
+func TestHumanOwnerAndAdminDownload(t *testing.T) {
+	e := newEnv(t)
+	e.put(appA, keyA, ownerA, []byte("bundle A"))
+	e.put(appB, keyB, ownerB, []byte("bundle B"))
+
+	// The owner of A: A downloads; B is forbidden.
+	owner := newBrowser(e)
+	resp, body := owner.signIn(keyA, ownerA, "owner-a@e2e.pathops.test", nil)
+	if resp.StatusCode != http.StatusOK || body != "bundle A" || resp.Header.Get(HeaderSHA256) != sum([]byte("bundle A")) ||
+		!strings.Contains(resp.Header.Get("Content-Disposition"), `attachment; filename=build-failure.tar.gz`) {
+		t.Fatal(resp.StatusCode, body, resp.Header)
+	}
+	if resp, _ := owner.get(e.srv.URL + "/objects/" + keyB); resp.StatusCode != http.StatusForbidden {
+		t.Fatal("owner of A reads B:", resp.StatusCode)
+	}
+	// The session is reused: no new sign-in for A.
+	if resp, body := owner.get(e.srv.URL + "/objects/" + keyA); resp.StatusCode != http.StatusOK || body != "bundle A" {
 		t.Fatal(resp.StatusCode)
+	}
+
+	// The Cell admin reads both.
+	adm := newBrowser(e)
+	if resp, body := adm.signIn(keyB, "admin-subject", admin, nil); resp.StatusCode != http.StatusOK || body != "bundle B" {
+		t.Fatal(resp.StatusCode, body)
+	}
+	if resp, _ := adm.get(e.srv.URL + "/objects/" + keyA); resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+
+	// Another signed-in person: forbidden. The admin's email unverified: too.
+	if resp, body := newBrowser(e).signIn(keyA, "someone-else", "x@e2e.pathops.test", nil); resp.StatusCode != http.StatusForbidden || body == "bundle A" {
+		t.Fatal(resp.StatusCode)
+	}
+	if resp, _ := newBrowser(e).signIn(keyA, "admin-subject", admin, map[string]any{"email_verified": false}); resp.StatusCode != http.StatusForbidden {
+		t.Fatal(resp.StatusCode)
+	}
+}
+
+func TestHumanSignInRefused(t *testing.T) {
+	e := newEnv(t)
+	e.put(appA, keyA, ownerA, []byte("bundle A"))
+	otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	for name, over := range map[string]map[string]any{
+		"wrong issuer":   {"iss": "https://dex.other-cell.example"},
+		"wrong audience": {"aud": "pathops-ui"},
+		"wrong nonce":    {"nonce": "replayed"},
+		"expired":        {"exp": time.Now().Unix() - 10},
+		"another key":    {"signer": otherKey},
+	} {
+		resp, body := newBrowser(e).signIn(keyA, ownerA, "owner-a@e2e.pathops.test", over)
+		if resp.StatusCode != http.StatusUnauthorized || body == "bundle A" {
+			t.Errorf("%s: %d", name, resp.StatusCode)
+		}
+	}
+	// A callback with an unknown state, or from another browser than the one
+	// that started the sign-in, is refused.
+	b := newBrowser(e)
+	if resp, _ := b.get(e.srv.URL + "/oauth2/callback?code=x&state=unknown"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatal(resp.StatusCode)
+	}
+	resp, _ := b.get(e.srv.URL + "/objects/" + keyA)
+	loc, _ := url.Parse(resp.Header.Get("Location"))
+	if resp, _ := newBrowser(e).get(e.srv.URL + "/oauth2/callback?code=x&state=" + url.QueryEscape(loc.Query().Get("state"))); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatal("callback from another browser:", resp.StatusCode)
+	}
+	// A forged session cookie is no session.
+	f := newBrowser(e)
+	u, _ := url.Parse(e.srv.URL)
+	f.client.Jar.SetCookies(u, []*http.Cookie{{Name: human.SessionCookie, Value: "forged"}})
+	if resp, _ := f.get(e.srv.URL + "/objects/" + keyA); resp.StatusCode != http.StatusFound {
+		t.Fatal("forged session:", resp.StatusCode)
 	}
 }
