@@ -88,33 +88,53 @@ A key has 1–16 segments separated by `/`, 1024 bytes at most.
 
 ### Workloads: Dex token exchange
 
-A workload acts for exactly one Application, with a short-lived Artifact Store
-token Dex issues (Dex patch `0007`, `artifactTokens`). There is no static
-credential and no TokenReview:
+A workload acts for exactly one Application and one key prefix inside it, with
+a short-lived Artifact Store token issued by the Cell's Dex through its
+generic workload token exchange (Decision 0065; Dex patch `0006`,
+`workloadTokenExchange`, output `pathops-artifact-store`). There is no static
+credential and no TokenReview.
+
+The workload is a real one. Today that is the Tenant Control Plane, which
+collects and stores a failed build's evidence itself. Later it will be the
+environment Evidence Collector. No Application has an Artifact Store
+ServiceAccount of its own.
 
 ```text
-<app>-artifact ServiceAccount (in <app>-ci, capability artifact-store)
-  -> Kubernetes TokenRequest (short-lived, Dex's workload audience)
-  -> Dex token exchange (requested_token_type ...:token-type:artifact)
-  -> JWT: aud pathops-artifact-store, pathops_application <id>,
-          pathops_operations [read, write], at most 5 minutes
+the workload's own ServiceAccount token (audience pathops-workload-exchange)
+  + the Tenant CP's actor token, bound to it: one Application, operations,
+    key prefix (e.g. applications/<id>/deliveries/<run>/)
+  -> Dex workload token exchange (audience pathops-artifact-store)
+  -> JWT: aud pathops-artifact-store, sub <the workload's ServiceAccount>,
+          pathops_application <id>, pathops_operations [read, write],
+          pathops_key_prefix applications/<id>/<scope>/, at most 5 minutes
   -> Authorization: Bearer <token>
 ```
 
-The store verifies the token locally: the EdDSA signature with Dex's artifact
-public key and its `kid`, the issuer, the audience, `exp`/`nbf` (30 s leeway),
-a lifetime of at most 5 minutes, a UUID `pathops_application` and known
-operations. Then:
+Dex copies the `pathops_*` claims from the Tenant CP's authorization without
+interpreting them. The store verifies the token locally:
 
-- **PUT** needs `write` and a key under `applications/<the token's
-  Application>/`; the object records the token's Application.
-- **GET/HEAD** need `read`, a key under the token's Application, **and** an
-  object that recorded that Application. The recorded Application is the
-  boundary; the key prefix is a second defense. Another Application's object
-  is 403 (prefix) or 404 (recorded Application), never its content.
+- the EdDSA signature with Dex's artifact public key and its `kid`;
+- the issuer and the audience;
+- `exp`/`nbf` (30 s leeway) and a lifetime of at most 5 minutes;
+- a UUID `pathops_application` and known operations;
+- a `pathops_key_prefix` that is a directory strictly inside
+  `applications/<that Application>/`.
 
-A Dex OIDC token, a registry token or a token of another Cell's Dex is not
-an Artifact Store token (other key, issuer or audience): 401.
+Then:
+
+- **PUT** needs `write` and a key under the token's key prefix. The object
+  records the token's Application.
+- **GET/HEAD** need `read`, a key under the token's key prefix, **and** an
+  object that recorded that Application.
+
+The recorded Application is the boundary. The key prefix is a second defense
+and the token's scope: the Tenant CP scopes a failed build's token to its
+DeliveryRun. Another Application's object, or another scope's, is 403 (prefix)
+or 404 (recorded Application), never its content.
+
+A Dex OIDC token, a registry token or a token of another Cell's Dex is not an
+Artifact Store token (other key, issuer or audience): 401. So is a token
+without a valid key prefix.
 
 ### People: Dex SSO
 
@@ -143,7 +163,7 @@ Anyone else signed in gets 403. There are no other roles.
 |---|---|
 | `302` | a person without a session (to Dex), or after the callback (to the object) |
 | `401` | a workload token is missing, forged, expired, of another issuer or audience, or lacks a valid PathOps claim; a refused sign-in |
-| `403` | the token lacks the operation or the key is outside its Application; a person who is neither the admin nor the owner |
+| `403` | the token lacks the operation or the key is outside its Application or key prefix; a person who is neither the admin nor the owner |
 | `404` | no such object, or (workloads) an object of another Application |
 | `503` | Dex cannot be reached for a sign-in |
 

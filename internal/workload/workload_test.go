@@ -15,11 +15,13 @@ const (
 	appA   = "11111111-1111-4111-8111-111111111111"
 	issuer = "https://dex.cell.example/artifacts"
 	aud    = "pathops-artifact-store"
+	tcp    = "system:serviceaccount:pathops-system:tenant-control-plane"
+	run    = "applications/" + appA + "/deliveries/33333333-3333-4333-8333-333333333333/"
 )
 
 var now = time.Unix(1_800_000_000, 0)
 
-// sign builds an EdDSA JWT as Dex patch 0007 does.
+// sign builds an EdDSA JWT as Dex's workload token exchange (patch 0006) does.
 func sign(key ed25519.PrivateKey, kid string, claims map[string]any) string {
 	h, _ := json.Marshal(map[string]string{"alg": "EdDSA", "typ": "JWT", "kid": kid})
 	c, _ := json.Marshal(claims)
@@ -28,17 +30,22 @@ func sign(key ed25519.PrivateKey, kid string, claims map[string]any) string {
 }
 
 func good() map[string]any {
-	return map[string]any{"iss": issuer, "aud": aud, "sub": "system:serviceaccount:app-a-ci:app-a-artifact",
+	return map[string]any{"iss": issuer, "aud": aud, "sub": tcp,
 		"iat": now.Unix(), "nbf": now.Unix(), "exp": now.Unix() + 300, "jti": "x",
-		"pathops_application": appA, "pathops_operations": []string{"read", "write"}}
+		"pathops_application": appA, "pathops_operations": []string{"read", "write"},
+		"pathops_key_prefix": run}
 }
 
 func TestVerify(t *testing.T) {
 	pub, key, _ := ed25519.GenerateKey(rand.Reader)
 	v := &Verifier{Issuer: issuer, Audience: aud, KeyID: "artifact-1", Key: pub, Now: func() time.Time { return now }}
 	p, err := v.Verify(sign(key, "artifact-1", good()))
-	if err != nil || p.Application != appA || !p.Allows(OpRead) || !p.Allows(OpWrite) || p.Subject != "system:serviceaccount:app-a-ci:app-a-artifact" {
+	if err != nil || p.Application != appA || !p.Allows(OpRead) || !p.Allows(OpWrite) || p.Subject != tcp || p.KeyPrefix != run {
 		t.Fatal(p, err)
+	}
+	if !p.Covers(run+"build-failure.tar.gz") || p.Covers(run) || p.Covers("applications/"+appA+"/deliveries/other/x") ||
+		p.Covers("applications/"+appA+"/x") {
+		t.Fatal("Covers")
 	}
 	// aud as an array.
 	c := good()
@@ -76,6 +83,12 @@ func TestVerifyRejects(t *testing.T) {
 		"application not uuid": with("pathops_application", "../b"),
 		"no operations":        with("pathops_operations", nil),
 		"unknown operation":    with("pathops_operations", []string{"read", "delete"}),
+		"no key prefix":        with("pathops_key_prefix", nil),
+		"another app's prefix": with("pathops_key_prefix", "applications/22222222-2222-4222-8222-222222222222/deliveries/"),
+		"application root":     with("pathops_key_prefix", "applications/"+appA+"/"),
+		"prefix not a dir":     with("pathops_key_prefix", "applications/"+appA+"/deliveries"),
+		"prefix escapes":       with("pathops_key_prefix", "applications/"+appA+"/../x/"),
+		"prefix outside":       with("pathops_key_prefix", "shared/"),
 		"no exp":               with("exp", nil),
 		"lifetime over 5m":     with("exp", now.Unix()+3600),
 		"no subject":           with("sub", nil),

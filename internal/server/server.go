@@ -9,15 +9,17 @@
 //	GET  /oauth2/callback      human: the end of a Dex sign-in
 //
 // Workload requests carry "Authorization: Bearer <Artifact Store token>", a
-// JWT Dex issues to an Application's artifact identity (internal/workload).
-// The token names exactly one Application; a request never does:
+// JWT the Cell's Dex issues through its workload token exchange with the
+// Tenant CP's authorization (internal/workload). The token names exactly one
+// Application and one key prefix inside it; a request names neither:
 //
-//   - PUT needs the write operation and a key under
-//     applications/<the token's Application>/; the object records that
-//     Application;
-//   - GET and HEAD need the read operation and an object that recorded the
-//     token's Application. The key's prefix is checked too, as a second
-//     defense, but the recorded Application is the boundary.
+//   - PUT needs the write operation and a key under the token's key prefix
+//     (itself under applications/<the token's Application>/); the object
+//     records that Application;
+//   - GET and HEAD need the read operation, a key under the token's key
+//     prefix and an object that recorded the token's Application. The
+//     recorded Application is the boundary; the prefixes are a second
+//     defense and the token's scope.
 //
 // Human requests carry no token: the store signs the person in with the
 // Cell's Dex (internal/human) and keeps a session cookie. An object is
@@ -219,6 +221,9 @@ func (s *Server) apiObject(w *statusWriter, r *http.Request, l *reqLog, raw stri
 		return
 	case applicationOf(raw) != p.Application:
 		s.fail(w, l, http.StatusForbidden, "the key is not under the token's Application")
+		return
+	case !p.Covers(raw):
+		s.fail(w, l, http.StatusForbidden, "the key is outside the token's scope")
 		return
 	}
 	rc := http.NewResponseController(w)

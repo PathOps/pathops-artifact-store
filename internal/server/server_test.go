@@ -31,12 +31,14 @@ const (
 	appA     = "11111111-1111-4111-8111-111111111111"
 	appB     = "22222222-2222-4222-8222-222222222222"
 	tokenIss = "https://dex.cell.example/artifacts"
-	tokenAud = "pathops-artifact-store"
-	clientID = "pathops-artifact-store-web"
-	secret   = "client-secret"
-	ownerA   = "owner-a-subject"
-	ownerB   = "owner-b-subject"
-	admin    = "admin-cell@demo.pathops.io"
+	// tcpSubject is the Tenant CP's own ServiceAccount, the subject of its tokens.
+	tcpSubject = "system:serviceaccount:pathops-system:tenant-control-plane"
+	tokenAud   = "pathops-artifact-store"
+	clientID   = "pathops-artifact-store-web"
+	secret     = "client-secret"
+	ownerA     = "owner-a-subject"
+	ownerB     = "owner-b-subject"
+	admin      = "admin-cell@demo.pathops.io"
 )
 
 var (
@@ -128,15 +130,23 @@ func newEnv(t *testing.T) *env {
 	return e
 }
 
-// token is an Artifact Store token of app as Dex issues it.
+// token is an Artifact Store token of app as Dex issues it for the Tenant CP:
+// scoped to app's deliveries.
 func (e *env) token(app string, ops ...string) string {
-	return e.tokenWith(map[string]any{"pathops_application": app, "pathops_operations": ops})
+	return e.tokenWith(map[string]any{"pathops_application": app, "pathops_operations": ops,
+		"pathops_key_prefix": "applications/" + app + "/deliveries/"})
+}
+
+// scoped is a read/write token of app limited to prefix.
+func (e *env) scoped(app, prefix string) string {
+	return e.tokenWith(map[string]any{"pathops_application": app, "pathops_key_prefix": prefix})
 }
 
 func (e *env) tokenWith(over map[string]any) string {
 	now := time.Now().Unix()
-	c := map[string]any{"iss": tokenIss, "aud": tokenAud, "sub": "system:serviceaccount:app-a-ci:app-a-artifact",
-		"iat": now, "nbf": now, "exp": now + 300, "pathops_application": appA, "pathops_operations": []string{"read", "write"}}
+	c := map[string]any{"iss": tokenIss, "aud": tokenAud, "sub": tcpSubject,
+		"iat": now, "nbf": now, "exp": now + 300, "pathops_application": appA, "pathops_operations": []string{"read", "write"},
+		"pathops_key_prefix": "applications/" + appA + "/deliveries/"}
 	for k, v := range over {
 		c[k] = v
 	}
@@ -185,7 +195,7 @@ func TestWorkloadApplicationIsolation(t *testing.T) {
 	var put PutResponse
 	_ = json.Unmarshal(b, &put)
 	if put.Ref != "pathops-artifact://dev/"+keyA || put.SHA256 != sum(bundle) || put.Size != int64(len(bundle)) || put.Application != appA ||
-		put.Owner != ownerA || put.CreatedBy != "system:serviceaccount:app-a-ci:app-a-artifact" {
+		put.Owner != ownerA || put.CreatedBy != tcpSubject {
 		t.Fatalf("%+v", put)
 	}
 	e.put(appB, keyB, ownerB, []byte("bundle of B"))
@@ -224,6 +234,37 @@ func TestWorkloadApplicationIsolation(t *testing.T) {
 	}
 }
 
+// A token is limited to its key prefix (Decision 0065: the Tenant CP scopes
+// it to one DeliveryRun): the run's own objects only, never another run of
+// the same Application, never another Application.
+func TestWorkloadKeyPrefixScope(t *testing.T) {
+	e := newEnv(t)
+	run := "applications/" + appA + "/deliveries/33333333-3333-4333-8333-333333333333/"
+	other := "applications/" + appA + "/deliveries/55555555-5555-4555-8555-555555555555/build-failure.tar.gz"
+	e.put(appA, other, ownerA, []byte("another run"))
+	tok := e.scoped(appA, run)
+	if resp, b := e.api(http.MethodPut, keyA, tok, []byte("mine"), "Content-Type", "application/gzip"); resp.StatusCode != http.StatusCreated {
+		t.Fatal(resp.StatusCode, string(b))
+	}
+	if resp, _ := e.api(http.MethodGet, keyA, tok, nil); resp.StatusCode != http.StatusOK {
+		t.Fatal(resp.StatusCode)
+	}
+	for name, c := range map[string]struct{ method, key string }{
+		"get another run":           {http.MethodGet, other},
+		"head another run":          {http.MethodHead, other},
+		"put in another run":        {http.MethodPut, "applications/" + appA + "/deliveries/55555555-5555-4555-8555-555555555555/x.tar.gz"},
+		"put beside the run":        {http.MethodPut, "applications/" + appA + "/deliveries/x.tar.gz"},
+		"put in B's same-named run": {http.MethodPut, "applications/" + appB + "/deliveries/33333333-3333-4333-8333-333333333333/x.tar.gz"},
+	} {
+		if resp, b := e.api(c.method, c.key, tok, []byte("evil")); resp.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
+		}
+	}
+	if resp, b := e.api(http.MethodGet, other, e.token(appA, "read"), nil); resp.StatusCode != http.StatusOK || string(b) != "another run" {
+		t.Fatal(resp.StatusCode, string(b))
+	}
+}
+
 func TestWorkloadTokensRefused(t *testing.T) {
 	e := newEnv(t)
 	e.put(appA, keyA, ownerA, []byte("x"))
@@ -244,6 +285,11 @@ func TestWorkloadTokensRefused(t *testing.T) {
 		"wrong audience":      e.tokenWith(map[string]any{"aud": "zot"}),
 		"wrong issuer":        e.tokenWith(map[string]any{"iss": "https://dex.other-cell.example/artifacts"}),
 		"missing application": e.tokenWith(map[string]any{"pathops_application": nil}),
+		"missing key prefix":  e.tokenWith(map[string]any{"pathops_key_prefix": nil}),
+		"B's key prefix":      e.scoped(appA, "applications/"+appB+"/deliveries/"),
+		"Application root":    e.scoped(appA, "applications/"+appA+"/"),
+		"prefix not a dir":    e.scoped(appA, "applications/"+appA+"/deliveries"),
+		"prefix escapes":      e.scoped(appA, "applications/"+appA+"/../"+appB+"/"),
 		"wrong operation":     e.tokenWith(map[string]any{"pathops_operations": []string{"admin"}}),
 		"forged":              forged,
 		"tampered":            parts[0] + "." + widened + "." + parts[2],
@@ -313,7 +359,7 @@ func TestPutLimitsAndValidation(t *testing.T) {
 		"bad metadata":     {[]byte("x"), []string{HeaderMetadata, `{"a":1}`}, http.StatusBadRequest},
 		"bad owner":        {[]byte("x"), []string{HeaderOwner, "two words"}, http.StatusBadRequest},
 	} {
-		if resp, b := e.api(http.MethodPut, "applications/"+appA+"/"+strings.ReplaceAll(name, " ", "-"), tok, c.body, c.hdr...); resp.StatusCode != c.want {
+		if resp, b := e.api(http.MethodPut, "applications/"+appA+"/deliveries/"+strings.ReplaceAll(name, " ", "-"), tok, c.body, c.hdr...); resp.StatusCode != c.want {
 			t.Errorf("%s: %d %s", name, resp.StatusCode, b)
 		}
 	}

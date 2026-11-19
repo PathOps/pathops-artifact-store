@@ -1,19 +1,27 @@
-// Package workload verifies the Artifact Store tokens Dex issues to
-// Application workloads (Decision 0061; Dex patch 0007, artifactTokens).
+// Package workload verifies the Artifact Store tokens the Cell's Dex issues
+// through its generic workload token exchange (Decisions 0061, 0065; Dex
+// patch 0006, workloadTokenExchange, output pathops-artifact-store).
 //
-// A workload (the Tenant Control Plane acting for one Application) exchanges a
-// Kubernetes token of the Application's <app>-artifact ServiceAccount at Dex
-// for a short-lived JWT signed with Dex's dedicated artifact key (EdDSA):
+// The caller is a real workload: today the Tenant Control Plane itself, which
+// stores a failed build's evidence; later the environment Evidence Collector.
+// It exchanges its own Kubernetes ServiceAccount token, together with an
+// actor token of the Tenant CP that decides the authorization, for a
+// short-lived JWT signed with Dex's dedicated artifact key (EdDSA):
 //
 //	{"iss": <artifact issuer>, "aud": <store audience>, "sub": <ServiceAccount>,
 //	 "iat", "nbf", "exp", "jti",
 //	 "pathops_application": <application id>,
-//	 "pathops_operations": ["read", "write"]}
+//	 "pathops_operations": ["read", "write"],
+//	 "pathops_key_prefix": "applications/<application id>/<scope>/"}
 //
-// The store verifies it locally, with no call to Dex or the Kubernetes API:
-// the signature with the configured public key (and its kid), the issuer, the
-// audience, the validity window and both PathOps claims. The Application is
-// read from the token only; a request never names it.
+// Dex copies the pathops_* claims from the Tenant CP's authorization without
+// interpreting them. The store verifies the token locally, with no call to
+// Dex or the Kubernetes API: the signature with the configured public key
+// (and its kid), the issuer, the audience, the validity window and the
+// PathOps claims. The Application and the key prefix are read from the token
+// only; a request never names them. The prefix is a directory strictly inside
+// the Application's (e.g. one DeliveryRun's), so a token reaches neither
+// another Application nor another scope of its own.
 package workload
 
 import (
@@ -26,9 +34,12 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+
+	"github.com/PathOps/pathops-artifact-store/internal/key"
 )
 
 // Operations a token may carry.
@@ -55,11 +66,22 @@ type Principal struct {
 	Subject     string
 	Application string
 	Operations  []string
-	Expiry      time.Time
+	// KeyPrefix bounds every key the token reaches: a directory strictly
+	// inside applications/<Application>/, ending with "/".
+	KeyPrefix string
+	Expiry    time.Time
 }
 
 // Allows reports whether the token carries op.
 func (p Principal) Allows(op string) bool { return slices.Contains(p.Operations, op) }
+
+// Covers reports whether the valid key k is inside the token's key prefix.
+func (p Principal) Covers(k string) bool { return p.KeyPrefix != "" && key.Within(k, p.KeyPrefix) }
+
+// validPrefix: prefix is applications/<app>/<one or more segments>/.
+func validPrefix(prefix, app string) bool {
+	return key.ValidatePrefix(prefix, 3) == nil && strings.HasPrefix(prefix, "applications/"+app+"/")
+}
 
 // Verifier verifies artifact tokens.
 type Verifier struct {
@@ -97,6 +119,7 @@ type claims struct {
 	Expiry      *int64          `json:"exp"`
 	Application string          `json:"pathops_application"`
 	Operations  []string        `json:"pathops_operations"`
+	KeyPrefix   string          `json:"pathops_key_prefix"`
 }
 
 // Verify returns the token's principal, or an error wrapping ErrInvalid.
@@ -134,10 +157,13 @@ func (v *Verifier) Verify(raw string) (Principal, error) {
 		return Principal{}, fmt.Errorf("%w: no Application", ErrInvalid)
 	case len(c.Operations) == 0 || slices.ContainsFunc(c.Operations, func(o string) bool { return o != OpRead && o != OpWrite }):
 		return Principal{}, fmt.Errorf("%w: operations", ErrInvalid)
+	case !validPrefix(c.KeyPrefix, c.Application):
+		return Principal{}, fmt.Errorf("%w: key prefix", ErrInvalid)
 	case c.Subject == "":
 		return Principal{}, fmt.Errorf("%w: no subject", ErrInvalid)
 	}
-	return Principal{Subject: c.Subject, Application: c.Application, Operations: c.Operations, Expiry: time.Unix(*c.Expiry, 0)}, nil
+	return Principal{Subject: c.Subject, Application: c.Application, Operations: c.Operations, KeyPrefix: c.KeyPrefix,
+		Expiry: time.Unix(*c.Expiry, 0)}, nil
 }
 
 // audience: "aud" is the expected string, or an array containing it.

@@ -24,7 +24,7 @@ type Config struct {
 	MaxObjectBytes int64         // PATHOPS_ARTIFACT_STORE_MAX_OBJECT_BYTES, default 4 GiB
 	RequestTimeout time.Duration // PATHOPS_ARTIFACT_STORE_REQUEST_TIMEOUT, default 30m
 
-	// Workload tokens (Dex artifactTokens).
+	// Workload tokens (Dex workloadTokenExchange, output pathops-artifact-store).
 	TokenIssuer        string // PATHOPS_ARTIFACT_STORE_TOKEN_ISSUER
 	TokenAudience      string // PATHOPS_ARTIFACT_STORE_TOKEN_AUDIENCE, default pathops-artifact-store
 	TokenKeyID         string // PATHOPS_ARTIFACT_STORE_TOKEN_KEY_ID
